@@ -13,7 +13,8 @@ import torch.distributed as dist
 from accelerate.utils import gather_object
 from data.data_utils import AverageMeter, ProgressMeter, Summary, dict_to_cuda
 from utils.utils import save_json
-from prompt import CN_FIND_BBOX_FROM_LIST_PROMPT, GET_OUTPUT_PROMPT, CN_FIND_BBOX_FROM_LIST_IMAGE_PROMPT, CN_FIND_BBOX_FROM_LIST_IMAGE_PROMPT_UPDATE
+from prompt import CN_FIND_BBOX_FROM_LIST_PROMPT, GET_OUTPUT_PROMPT, CN_FIND_BBOX_FROM_LIST_IMAGE_PROMPT, \
+    CN_FIND_BBOX_FROM_LIST_IMAGE_PROMPT_UPDATE, PROMPT_TEMPLATE_SEECLICK_PARSED_CONTENT
 import ollama
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ import os
 import base64
 import matplotlib.pyplot as plt
 import io
+from io import BytesIO
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 load_dotenv()
@@ -121,25 +123,35 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-def get_find_bbox_input(type, instruction, list_items, image_path=None):
-    user_input = """- Input: "type={type}: {instruction}"
-- Labeled Image: (image)
-- List:
-```json
-{list_items}
-```
-"""
-    user_input = user_input.format(type=type, instruction=instruction, list_items=list_items)
-    base64_image = encode_image(image_path)
+def get_find_bbox_input(prompt_origin, base64_image, dino_labled_img):
     messages = [
-        {'role': 'developer', 'content': CN_FIND_BBOX_FROM_LIST_IMAGE_PROMPT_UPDATE},
+        {
+            "role": "developer",
+            "content": [
+                # {"type": "text", "text": "You are an expert in using electronic devices and interacting with graphic interfaces. You should not call any external tools."}
+                {"type": "text", "text": '''You are an expert at completing instructions on GUI screens. 
+    You will be presented with two images. The first is the original screenshot. The second is the same screenshot with some numeric tags. You will also be provided with some descriptions of the bbox, and your task is to choose the numeric bbox idx you want to click in order to complete the user instruction.'''}
+            ],
+        },
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": user_input},
+                {
+                    "type": "text", 
+                    "text": prompt_origin
+
+                },
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64_image}",
+                    }
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{dino_labled_img}",
+                    }
                 },
             ],
         }
@@ -177,8 +189,25 @@ def bbox_2_point(bbox, dig=2):
     point = [round(x,4) for x in point]
     return point
 
+def convert_pil_image_to_base64(image):
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode()
+
+def reformat_messages(parsed_content_list):
+    screen_info = ""
+    for idx, element in enumerate(parsed_content_list):
+        element['idx'] = idx
+        if element['type'] == 'text':
+            screen_info += f'''<p id={idx} class="text" alt="{element['content']}"> </p>\n'''
+            # screen_info += f'ID: {idx}, Text: {element["content"]}\n'
+        elif element['type'] == 'icon':
+            screen_info += f'''<img id={idx} class="icon" alt="{element['content']}"> </img>\n'''
+            # screen_info += f'ID: {idx}, Icon: {element["content"]}\n'
+    return screen_info
+
 @torch.no_grad()
-def validate_screenspot(val_file):
+def validate_screenspot(name, val_file):
     answers_unique = []
     generated_texts_unique = []
     outputs_unique = []
@@ -191,18 +220,27 @@ def validate_screenspot(val_file):
     metric = 0
     
     # if use filter 0
-    val_data = val_data['desktop']['icon'] + val_data['mobile']['icon'] + val_data['web']['icon']
+    if name in ['filter_0']:
+        val_data = val_data['desktop']['icon'] + val_data['mobile']['icon'] + val_data['web']['icon']
     
     for i, item in enumerate(tqdm(val_data)):
         torch.cuda.empty_cache()
         
         # get image
-        # image_path = "/home/han/Documents/repos/ShowUI/datasets/ScreenSpot/images/" + item['img_url']
-        image_path = item['img_path'] # for filter 0
-        image = Image.open(image_path)
-        image_rgb = image.convert('RGB')
+        if name in ['filter_0']:
+            image_path = item['img_path']
+        else:
+            image_path = "/home/han/Documents/repos/ShowUI/datasets/ScreenSpot/images/" + item['img_url']
+        # image_path = item['img_path'] # for filter 0
+        image = Image.open(image_path).convert('RGB')
+        base64_image = convert_pil_image_to_base64(image)
+        
+        if name in ['filter_0']:
+            meta = item['meta']
+        else:
+            meta = item
         # meta = item
-        meta = item['meta'] # for filter 0  
+        # meta = item['meta'] # for filter 0  
         
             
         # config
@@ -213,71 +251,65 @@ def validate_screenspot(val_file):
             'text_padding': max(int(3 * box_overlay_ratio), 1),
             'thickness': max(int(3 * box_overlay_ratio), 1),
         }
-        BOX_TRESHOLD = 0.2
+        BOX_TRESHOLD = 0.05
         try:
-            ocr_bbox_rslt, is_goal_filtered = check_ocr_box(image_path, display_img = False, output_bb_format='xyxy', goal_filtering=None, easyocr_args={'paragraph': False, 'text_threshold':0.7}, use_paddleocr=True)
+            ocr_bbox_rslt, is_goal_filtered = check_ocr_box(image_path, display_img = False, output_bb_format='xyxy', goal_filtering=None, easyocr_args={'paragraph': False, 'text_threshold':0.5}, use_paddleocr=True)
             text, ocr_bbox = ocr_bbox_rslt
 
             dino_labled_img, label_coordinates, parsed_content_list = get_som_labeled_img(image_path, som_model, BOX_TRESHOLD = BOX_TRESHOLD, output_coord_in_ratio=True, ocr_bbox=ocr_bbox,draw_bbox_config=draw_bbox_config, caption_model_processor=caption_model_processor, ocr_text=text,use_local_semantics=True, iou_threshold=0.7, scale_img=False, batch_size=128)
             
-            # save image to local
-            image = Image.open(io.BytesIO(base64.b64decode(dino_labled_img)))
-            plt.figure(figsize=(15,15))
-            plt.axis('off')
-            plt.imshow(image)
-            plt.savefig("_labeled_img", bbox_inches='tight', pad_inches=0, dpi=400)
-            plt.close()
-
-            # add id in parsed_content_list
-            for idx, content in enumerate(parsed_content_list, start=0):
-                content['id'] = idx
+            screen_info = reformat_messages(parsed_content_list)
+            prompt_origin = PROMPT_TEMPLATE_SEECLICK_PARSED_CONTENT.format(meta['task'], screen_info)
             
-            # filter parsed_content_list by icon/text
-            parsed_content_list = filter_items(parsed_content_list, item['data_type']) 
-            parsed_content_list_str = json.dumps(parsed_content_list, ensure_ascii=False, indent=4)
+            # # filter parsed_content_list by icon/text
+            # parsed_content_list = filter_items(parsed_content_list, item['data_type']) 
+            # parsed_content_list_str = json.dumps(parsed_content_list, ensure_ascii=False, indent=4)
             
             # find similar bbox
-            messages = get_find_bbox_input(item['data_type'], meta['task'], parsed_content_list_str, "./_labeled_img.png")
-            # response = ollama.chat(model='phi4:14b-q8_0', messages=messages)
-            # box_response = response['message']['content']
+            messages = get_find_bbox_input(prompt_origin, base64_image, dino_labled_img)
             completion = client.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
             )
-            box_response = completion.choices[0].message.content
+            response_text = completion.choices[0].message.content
             
-            # extract bbox
-            messages = get_extract_bbox_input(box_response)
-            response = ollama.chat(model='phi4:14b-q8_0', messages=messages)
-            response = response['message']['content']
-            
-            # bbox str to json
-            pred_obj = extract_bbox(response)
-            if pred_obj:
-                pred_bbox = pred_obj['bbox']
-                pred_point = bbox_2_point(pred_bbox)
-                generated_texts = str(pred_point)
-            else:
-                generated_texts = "[0, 0]"
+                
+            try:
+                response_text = ast.literal_eval(response_text)
+                
+                icon_id = response_text['Click BBox ID']
+                analysis = response_text['Analysis']
+                bbox_caption = parsed_content_list[int(icon_id)].get('content', None)
+                bbox = label_coordinates[str(icon_id)]
+                click_point = str([bbox[0] + bbox[2]/2, bbox[1] + bbox[3]/2])
+            except:
+                bbox_caption = 'error'
+                analysis = "An error occurred"
+                click_point = "[0, 0]"
+                print('error parsing, use regex to parse!!!')
+
+            # pdb.set_trace() 
 
         except Exception as e:
-            generated_texts = "[0, 0]"
+            analysis = "An error occurred"
+            bbox_caption = 'error'
+            click_point = "[0, 0]"
             print(f"An error occurred: {e}")
         
         # show
         print(f"--Instruction: {meta['task']}")
-        print(f"--Answer: {pred_obj['content'] if pred_obj else None,}")
+        print(f"--Answer: {bbox_caption}")
         # pdb.set_trace()
 
         outputs = {"split": meta['split'], 'data_type': meta['data_type'],
-                    "anno_id": meta['id'], "img_path": image_path, "instruction": meta['task'], "sentence": generated_texts, "pred_content" : pred_obj['content'] if pred_obj else None,
+                    "anno_id": meta['id'], "img_path": image_path, "instruction": meta['task'], "sentence": click_point, "Analysis" : analysis, "bbox caption": bbox_caption,
                     "bbox": meta['bbox'], 
                     "meta": meta}
-        generated_texts_unique.append(generated_texts)
+        generated_texts_unique.append(click_point)
         answers_unique.append(meta['bbox'])
         outputs_unique.append(outputs)
         
-        # if i % 5 == 4:
+        # if i % 3 == 2:
         #     break
 
     answers_unique = gather_object(answers_unique)
@@ -328,12 +360,13 @@ def validate_screenspot(val_file):
     metric = sum(score_all) / len(score_all)
     eval_dict['Avg Success Rate'] = metric
 
-    save_json(results, os.path.join("./", f'screenspot_omniparser_tmp_dict.json'))
-    save_json(eval_dict, os.path.join("./", f'screenspot_omniparser_res_dict.json'))
+    save_json(results, os.path.join("./", f'{name}_screenspot_omniparser_tmp_dict.json'))
+    save_json(eval_dict, os.path.join("./", f'{name}_screenspot_omniparser_res_dict.json'))
 
     # metric = broadcast_value(metric, src=0, local_rank=local_rank)
     return metric
 
 if __name__ == '__main__':
     # validate_screenspot('/home/han/Documents/repos/ShowUI/datasets/ScreenSpot/metadata/hf_test_full.json')
-    validate_screenspot('./screenspot_omniparser_tmp_dict_filter_0_ori.json')
+    validate_screenspot(name = 'filter_0', val_file='./screenspot_omniparser_tmp_dict_filter_0_ori.json')
+    validate_screenspot(name = 'full_screenspot', val_file='/home/han/Documents/repos/ShowUI/datasets/ScreenSpot/metadata/hf_test_full.json')
